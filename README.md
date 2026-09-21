@@ -1,6 +1,6 @@
 # Autoimmune cloud
 
-**CITS4403 Computational Modelling — research project**
+**CITS4403 Computational Modelling research project**
 
 > Does an automated remediation system have a sensitivity threshold past which
 > it destroys more of the platform than the faults it is defending against?
@@ -15,7 +15,7 @@ outage than it prevents.
 
 A platform runs many service instances. Each carries a share of the traffic and
 has finite capacity. When an instance is removed, **its traffic does not
-vanish** — it lands on its neighbours, which may push them past their own
+vanish** it lands on its neighbours, which may push them past their own
 limits. That is a load-redistribution cascade.
 
 Nobody watches hundreds of instances by hand, so platforms deploy anomaly
@@ -25,7 +25,7 @@ has an unavoidable error rate, because the telemetry of a genuinely faulty
 instance and of a merely busy one overlap.
 
 In a monitored system a false positive costs an engineer's attention. In an
-automated system it **removes a healthy instance** — and that sheds traffic onto
+automated system it **removes a healthy instance** and that sheds traffic onto
 its neighbours, which makes them look busy, which trips the detector again:
 
 ```
@@ -47,7 +47,7 @@ pathogens faster, but past a point destroys healthy tissue.
 | **States** | `HEALTHY`, `DEGRADED`, `SHEDDING`, `DOWN`, `QUARANTINING`, `QUARANTINED` |
 | **Neighbourhood** | von Neumann (4) or Moore (8), identical for every cell |
 | **Rule** | one transition function, applied uniformly |
-| **Update** | synchronous — the lattice advances from `t` to `t+1` using only the configuration at `t` |
+| **Update** | synchronous the lattice advances from `t` to `t+1` using only the configuration at `t` |
 | **Boundary** | fixed, non-periodic |
 
 Each cell also carries a real-valued load, as the sandpile CA carries a grain
@@ -97,7 +97,7 @@ margin several times the telemetry noise:
 delta > (1/|N|)/(1 + alpha) + z*sigma,    z ~ 4-5
 ```
 
-Below this, **no threshold is safe** — every setting is either blind or
+Below this, **no threshold is safe** every setting is either blind or
 self-destructive, and tuning cannot help because the problem is the signal, not
 the threshold. Measured onsets sit 4.0–5.4σ above the analytic floor across four
 spare-capacity levels.
@@ -109,7 +109,7 @@ structure determine total system damage in an automated remediation system?
 
 ## Hypotheses
 
-- **H1.** Total damage as a function of detector sensitivity is **U-shaped** —
+- **H1.** Total damage as a function of detector sensitivity is **U-shaped**
   too permissive and faults go unremediated, too aggressive and false-positive
   quarantine cascades. The minimum is interior, and its location depends on
   spare capacity and neighbourhood structure rather than on detector accuracy.
@@ -118,20 +118,20 @@ structure determine total system damage in an automated remediation system?
 - **H2.** There is a **critical sensitivity** above which remediation alone is
   supercritical. *Supported: at α = 0.6, where the overload cascade is
   impossible (α_c = 0.25), switching the detector on below θ_c destroys 100% of
-  the lattice. Damage holds low and then jumps — a 50% change for a 0.01 change
+  the lattice. Damage holds low and then jumps a 50% change for a 0.01 change
   in threshold.*
 - **H3.** Replacing the uniform lattice neighbourhood with a service
   **dependency graph**, leaving the state set and transition rule unchanged,
   changes the character of the transition. *Supported, with a qualification:
   lattice, small-world and random graphs all give 0% intermediate-sized
   failures, while scale-free gives 33% and never loses everything. The driver is
-  degree spread, not path length. But the safe threshold itself barely moves —
+  degree spread, not path length. But the safe threshold itself barely moves
   topology governs how you fail, not where the cliff is.*
 
 ## Originality and contribution
 
-This is not one of the excluded models — it is not Game of Life, Schelling,
-Sugarscape, traffic, flocking, evolution, or the Prisoner's Dilemma — and it is
+This is not one of the excluded models it is not Game of Life, Schelling,
+Sugarscape, traffic, flocking, evolution, or the Prisoner's Dilemma and it is
 not a reimplementation of an existing published model.
 
 **What it builds on.** The load-redistribution half is in the same family as the
