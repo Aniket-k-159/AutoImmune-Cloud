@@ -1,0 +1,8 @@
+# Core model and analysis
+numpy>=1.24
+networkx>=3.0
+matplotlib>=3.7
+
+# Running the notebooks
+jupyterlab>=4.0
+nbformat>=5.9
