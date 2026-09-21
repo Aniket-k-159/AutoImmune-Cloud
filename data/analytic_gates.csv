@@ -1,0 +1,11 @@
+quantity,neighbourhood,degree,alpha,predicted,measured
+alpha_c,von_neumann,4,,0.250000,0.250000
+theta_c,von_neumann,4,0.40,0.892857,0.892857
+theta_c,von_neumann,4,0.60,0.781250,0.779250
+theta_c,von_neumann,4,0.80,0.694444,0.692444
+theta_c,von_neumann,4,1.00,0.625000,0.623000
+alpha_c,moore,8,,0.125000,0.125000
+theta_c,moore,8,0.40,0.803571,0.801571
+theta_c,moore,8,0.60,0.703125,0.701125
+theta_c,moore,8,0.80,0.625000,0.623000
+theta_c,moore,8,1.00,0.562500,0.560500
