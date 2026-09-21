@@ -39,7 +39,7 @@ Positive feedback on the substrate the system is supposed to protect. The
 biological parallel is autoimmunity: a more aggressive immune response clears
 pathogens faster, but past a point destroys healthy tissue.
 
-## Modelling paradigm — cellular automaton
+## Modelling paradigm cellular automaton
 
 | CA component | In this model |
 |---|---|
