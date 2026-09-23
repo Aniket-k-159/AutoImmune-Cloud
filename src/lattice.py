@@ -71,6 +71,7 @@ excess to lattice neighbours. It differs in two ways that matter:
 """
 
 import numpy as np
+import run_protocol
 
 # --- states ---------------------------------------------------------------
 HEALTHY = 0
@@ -247,17 +248,17 @@ class LatticeCA:
         self.t += 1
         return changed
 
-    def run(self, max_steps=2000):
-        """Iterate until no cell changes state. Returns the per-step count of
-        removed cells."""
-        history = [self.n_removed]
-        for _ in range(max_steps):
-            if self.step() == 0:
-                break
-            history.append(self.n_removed)
-        else:
-            raise RuntimeError("lattice CA did not reach a fixed point")
-        return history
+    def run_for(self, steps):
+        """Observe exactly `steps` additional timesteps."""
+        return run_protocol.run_for(self, steps)
+
+    def run_until_stable(self, max_steps=2000):
+        """Run a deterministic cascade; inspect summary() for the stop reason."""
+        return run_protocol.run_until_stable(self, max_steps, TRANSIENT)
+
+    def run(self, max_steps=2000, *, steps=None):
+        """Use an explicit window, or deterministic convergence when omitted."""
+        return self.run_until_stable(max_steps) if steps is None else self.run_for(steps)
 
     # -- seeding and measurement ------------------------------------------
 
@@ -308,6 +309,7 @@ class LatticeCA:
             "degraded_cell_steps": self.degraded_cell_steps,
             "true_positive": self.n_true_positive,
             "false_positive": self.n_false_positive,
+            **getattr(self, "_run_info", {}),
         }
 
 
@@ -336,8 +338,7 @@ def run_episode(alpha, theta, steps=150, width=50, height=50,
                    neighbourhood=neighbourhood, theta=theta, noise=noise,
                    load_sigma=load_sigma, fault_rate=fault_rate,
                    fault_signal=fault_signal, seed=seed)
-    for _ in range(steps):
-        ca.step()
+    ca.run_for(steps)
 
     n = ca.n_cells
     unremediated = ca.degraded_cell_steps / n
@@ -353,6 +354,7 @@ def run_episode(alpha, theta, steps=150, width=50, height=50,
         "total_damage": unremediated + overload + false_positive,
         "removed_fraction": ca.removed_fraction,
         "ca": ca,
+        **ca._run_info,
     }
 
 
@@ -385,14 +387,13 @@ def sweep_theta(thetas, alpha=0.6, replicates=8, steps=150, width=50,
 
 
 def run_trial(alpha, width=60, height=60, neighbourhood="von_neumann",
-              theta=np.inf, noise=0.0, load_sigma=0.0, seed=None):
-    """One cascade on a fresh lattice: seed the centre cell, run to a fixed
-    point, and report what was lost."""
+              theta=np.inf, noise=0.0, load_sigma=0.0, seed=None, *, steps=None):
+    """Seed the centre cell. Stochastic trials require an explicit window."""
     ca = LatticeCA(width=width, height=height, alpha=alpha,
                    neighbourhood=neighbourhood, theta=theta, noise=noise,
                    load_sigma=load_sigma, seed=seed)
     ca.seed_failure()
-    history = ca.run()
+    history = ca.run(steps=steps)
     out = ca.summary()
     out["history"] = history
     out["avalanche_size"] = out["removed"] - 1
@@ -402,13 +403,13 @@ def run_trial(alpha, width=60, height=60, neighbourhood="von_neumann",
 
 def sweep_alpha(alphas, replicates=10, width=60, height=60,
                 neighbourhood="von_neumann", theta=np.inf, noise=0.0,
-                load_sigma=0.3, seed=0):
+                load_sigma=0.3, seed=0, *, steps=None):
     """Sweep spare capacity. Returns mean removed fraction, its standard
     deviation, and susceptibility (variance across replicates)."""
     mean, std, susceptibility = [], [], []
     for a in alphas:
         vals = [run_trial(a, width, height, neighbourhood, theta, noise,
-                          load_sigma, seed=seed * 1000 + r)["removed_fraction"]
+                          load_sigma, seed=seed * 1000 + r, steps=steps)["removed_fraction"]
                 for r in range(replicates)]
         vals = np.asarray(vals)
         mean.append(vals.mean())

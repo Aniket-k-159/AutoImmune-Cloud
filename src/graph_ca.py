@@ -31,6 +31,7 @@ all-or-nothing transition into avalanches of every size.
 """
 
 import numpy as np
+import run_protocol
 import networkx as nx
 
 from lattice import (HEALTHY, SHEDDING, DOWN, QUARANTINING, QUARANTINED,
@@ -201,15 +202,17 @@ class GraphCA:
         self.t += 1
         return changed
 
-    def run(self, max_steps=5000):
-        history = [self.n_removed]
-        for _ in range(max_steps):
-            if self.step() == 0:
-                break
-            history.append(self.n_removed)
-        else:
-            raise RuntimeError("graph CA did not reach a fixed point")
-        return history
+    def run_for(self, steps):
+        """Observe exactly `steps` additional timesteps."""
+        return run_protocol.run_for(self, steps)
+
+    def run_until_stable(self, max_steps=5000):
+        """Run a deterministic cascade; inspect summary() for the stop reason."""
+        return run_protocol.run_until_stable(self, max_steps, TRANSIENT)
+
+    def run(self, max_steps=5000, *, steps=None):
+        """Use an explicit window, or deterministic convergence when omitted."""
+        return self.run_until_stable(max_steps) if steps is None else self.run_for(steps)
 
     # -- seeding and measurement ------------------------------------------
 
@@ -248,6 +251,7 @@ class GraphCA:
             "degraded_cell_steps": self.degraded_cell_steps,
             "true_positive": self.n_true_positive,
             "false_positive": self.n_false_positive,
+            **getattr(self, "_run_info", {}),
         }
 
 
@@ -256,12 +260,12 @@ class GraphCA:
 # --------------------------------------------------------------------------
 
 def run_trial(graph, alpha, theta=np.inf, noise=0.0, load_mode="uniform",
-              seed_node=None, seed=None):
-    """Seed one failure and run to a fixed point."""
+              seed_node=None, seed=None, *, steps=None):
+    """Seed one failure. Stochastic trials require an explicit window."""
     ca = GraphCA(graph, alpha=alpha, theta=theta, noise=noise,
                  load_mode=load_mode, seed=seed)
     node = ca.seed_failure(seed_node)
-    history = ca.run()
+    history = ca.run(steps=steps)
     out = ca.summary()
     out["seed_node"] = node
     out["seed_degree"] = int(ca.degree[node])
@@ -278,8 +282,7 @@ def run_episode(graph, alpha, theta, steps=150, noise=0.03, fault_rate=2e-4,
     ca = GraphCA(graph, alpha=alpha, theta=theta, noise=noise,
                  fault_rate=fault_rate, fault_signal=fault_signal,
                  load_mode=load_mode, seed=seed)
-    for _ in range(steps):
-        ca.step()
+    ca.run_for(steps)
     n = ca.n
     unremediated = ca.degraded_cell_steps / n
     overload = ca.n_down / n
@@ -292,6 +295,7 @@ def run_episode(graph, alpha, theta, steps=150, noise=0.03, fault_rate=2e-4,
         "total_damage": unremediated + overload + false_positive,
         "removed_fraction": ca.removed_fraction,
         "ca": ca,
+        **ca._run_info,
     }
 
 
@@ -316,7 +320,7 @@ def sweep_theta(graph, thetas, alpha=0.6, replicates=8, steps=150, noise=0.03,
 
 
 def avalanche_sizes(graph, alpha, trials=400, theta=np.inf, noise=0.0,
-                    load_mode="uniform", seed=0):
+                    load_mode="uniform", seed=0, *, steps=None):
     """Avalanche size from `trials` independent single-cell failures, together
     with the degree of each seeded cell."""
     rng = np.random.default_rng(seed)
@@ -325,7 +329,7 @@ def avalanche_sizes(graph, alpha, trials=400, theta=np.inf, noise=0.0,
         node = int(rng.integers(graph.number_of_nodes()))
         r = run_trial(graph, alpha, theta=theta, noise=noise,
                       load_mode=load_mode, seed_node=node,
-                      seed=int(rng.integers(1 << 30)))
+                      seed=int(rng.integers(1 << 30)), steps=steps)
         sizes.append(r["avalanche_size"])
         degrees.append(r["seed_degree"])
     return np.asarray(sizes), np.asarray(degrees)
