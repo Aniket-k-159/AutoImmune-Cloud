@@ -112,12 +112,20 @@ class LatticeCA:
     load_sigma : float
         Lognormal spread of initial per-cell load. 0 gives a uniform lattice.
     seed : int | None
+    redistribution : "legacy" | "serving_neighbours"
+        "legacy" shares across all static neighbours and records cleared
+        shares as dropped load. "serving_neighbours" shares only across
+        HEALTHY or DEGRADED neighbours at the start of the step. With no
+        eligible recipient, the donor's load is dropped in full.
     """
 
     def __init__(self, width=60, height=60, alpha=0.3,
                  neighbourhood="von_neumann", theta=np.inf, noise=0.0,
                  load_sigma=0.0, fault_rate=0.0, fault_signal=0.35,
-                 seed=None):
+                 seed=None, *, redistribution="legacy"):
+        if redistribution not in ("legacy", "serving_neighbours"):
+            raise ValueError(f"unknown redistribution: {redistribution}")
+        self.redistribution = redistribution
         self.w, self.h = width, height
         self.alpha = alpha
         self.theta = theta
@@ -143,6 +151,8 @@ class LatticeCA:
         else:
             self.load = np.ones((height, width), dtype=float)
         self.load0 = self.load.copy()
+        self.initial_load = float(self.load.sum())
+        self.dropped_load = 0.0
         self.capacity = (1.0 + alpha) * self.load0
 
         # |N(j)| for every cell -- smaller on edges and corners, since the
@@ -202,12 +212,27 @@ class LatticeCA:
         a fixed point.
         """
         # 1. gather load spilled by neighbours that failed on the previous step
+        transient = np.isin(self.state, TRANSIENT)
+        absorbing = np.isin(self.state, (DOWN, QUARANTINED))
+        serving = np.isin(self.state, SERVING)
+        recipients = self.degree
+        if self.redistribution == "serving_neighbours":
+            recipients = np.zeros_like(self.load)
+            for dy, dx in self.offsets:
+                recipients += self._shifted(serving, dy, dx, False)
         incoming = np.zeros_like(self.load)
-        spill = np.where(np.isin(self.state, TRANSIENT),
-                         self.load / np.maximum(self.degree, 1), 0.0)
+        spill = np.where(transient,
+                         self.load / np.maximum(recipients, 1), 0.0)
         for dy, dx in self.offsets:
             incoming += self._shifted(spill, dy, dx, 0.0)
+        if self.redistribution == "serving_neighbours":
+            incoming[~serving] = 0.0
 
+        # Cleared incoming shares and unroutable donor load leave the system.
+        self.dropped_load += float(
+            incoming[transient | absorbing].sum()
+            + self.load[transient & (recipients == 0)].sum()
+            + self.load[absorbing].sum())
         new_load = self.load + incoming
         new_state = self.state.copy()
 
@@ -226,7 +251,6 @@ class LatticeCA:
 
         # 4. every serving cell applies the local rule. Overload is checked
         #    first: a cell over capacity fails whatever the detector thinks.
-        serving = np.isin(self.state, SERVING)
         over = serving & (new_load > self.capacity)
         new_state[over] = SHEDDING
 
@@ -309,13 +333,23 @@ class LatticeCA:
             "degraded_cell_steps": self.degraded_cell_steps,
             "true_positive": self.n_true_positive,
             "false_positive": self.n_false_positive,
+            **self.load_accounting(),
             **getattr(self, "_run_info", {}),
         }
+
+    def load_accounting(self):
+        """Current load includes transient cells awaiting their next transfer."""
+        current = float(self.load.sum())
+        return {"redistribution": self.redistribution,
+                "initial_load": self.initial_load, "current_load": current,
+                "dropped_load": self.dropped_load,
+                "load_balance_error": self.initial_load - current - self.dropped_load}
 
 
 def run_episode(alpha, theta, steps=150, width=50, height=50,
                 neighbourhood="von_neumann", noise=0.03, load_sigma=0.0,
-                fault_rate=2e-4, fault_signal=0.35, seed=None):
+                fault_rate=2e-4, fault_signal=0.35, seed=None, *,
+                redistribution="legacy"):
     """
     Run a platform for a fixed number of steps under a background fault rate,
     with the detector operating at threshold `theta`.
@@ -337,7 +371,7 @@ def run_episode(alpha, theta, steps=150, width=50, height=50,
     ca = LatticeCA(width=width, height=height, alpha=alpha,
                    neighbourhood=neighbourhood, theta=theta, noise=noise,
                    load_sigma=load_sigma, fault_rate=fault_rate,
-                   fault_signal=fault_signal, seed=seed)
+                   fault_signal=fault_signal, seed=seed, redistribution=redistribution)
     ca.run_for(steps)
 
     n = ca.n_cells
@@ -354,13 +388,15 @@ def run_episode(alpha, theta, steps=150, width=50, height=50,
         "total_damage": unremediated + overload + false_positive,
         "removed_fraction": ca.removed_fraction,
         "ca": ca,
+        **ca.load_accounting(),
         **ca._run_info,
     }
 
 
 def sweep_theta(thetas, alpha=0.6, replicates=8, steps=150, width=50,
                 height=50, neighbourhood="von_neumann", noise=0.03,
-                fault_rate=2e-4, fault_signal=0.35, seed=0):
+                fault_rate=2e-4, fault_signal=0.35, seed=0, *,
+                redistribution="legacy"):
     """
     Sweep detector sensitivity and return the damage decomposition.
 
@@ -376,7 +412,8 @@ def sweep_theta(thetas, alpha=0.6, replicates=8, steps=150, width=50,
         runs = [run_episode(alpha, th, steps=steps, width=width, height=height,
                             neighbourhood=neighbourhood, noise=noise,
                             fault_rate=fault_rate, fault_signal=fault_signal,
-                            seed=seed * 10000 + i * 100 + r)
+                            seed=seed * 10000 + i * 100 + r,
+                            redistribution=redistribution)
                 for r in range(replicates)]
         for k in keys:
             out[k].append(float(np.mean([r[k] for r in runs])))
@@ -387,11 +424,12 @@ def sweep_theta(thetas, alpha=0.6, replicates=8, steps=150, width=50,
 
 
 def run_trial(alpha, width=60, height=60, neighbourhood="von_neumann",
-              theta=np.inf, noise=0.0, load_sigma=0.0, seed=None, *, steps=None):
+              theta=np.inf, noise=0.0, load_sigma=0.0, seed=None, *, steps=None,
+              redistribution="legacy"):
     """Seed the centre cell. Stochastic trials require an explicit window."""
     ca = LatticeCA(width=width, height=height, alpha=alpha,
                    neighbourhood=neighbourhood, theta=theta, noise=noise,
-                   load_sigma=load_sigma, seed=seed)
+                   load_sigma=load_sigma, seed=seed, redistribution=redistribution)
     ca.seed_failure()
     history = ca.run(steps=steps)
     out = ca.summary()
@@ -403,13 +441,14 @@ def run_trial(alpha, width=60, height=60, neighbourhood="von_neumann",
 
 def sweep_alpha(alphas, replicates=10, width=60, height=60,
                 neighbourhood="von_neumann", theta=np.inf, noise=0.0,
-                load_sigma=0.3, seed=0, *, steps=None):
+                load_sigma=0.3, seed=0, *, steps=None, redistribution="legacy"):
     """Sweep spare capacity. Returns mean removed fraction, its standard
     deviation, and susceptibility (variance across replicates)."""
     mean, std, susceptibility = [], [], []
     for a in alphas:
         vals = [run_trial(a, width, height, neighbourhood, theta, noise,
-                          load_sigma, seed=seed * 1000 + r, steps=steps)["removed_fraction"]
+                          load_sigma, seed=seed * 1000 + r, steps=steps,
+                          redistribution=redistribution)["removed_fraction"]
                 for r in range(replicates)]
         vals = np.asarray(vals)
         mean.append(vals.mean())

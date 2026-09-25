@@ -103,11 +103,18 @@ class GraphCA:
         initial load proportional to degree, which is more realistic for a
         service dependency graph where widely-called services carry more
         traffic.
+    redistribution : "legacy" | "serving_neighbours"
+        As in LatticeCA: preserve static-neighbour sharing, or transfer only
+        to neighbours serving at the start of the step. Unserved load is
+        recorded as dropped; it is not queued or routed beyond neighbours.
     """
 
     def __init__(self, graph, alpha=0.3, theta=np.inf, noise=0.0,
                  fault_rate=0.0, fault_signal=0.35, load_mode="uniform",
-                 seed=None):
+                 seed=None, *, redistribution="legacy"):
+        if redistribution not in ("legacy", "serving_neighbours"):
+            raise ValueError(f"unknown redistribution: {redistribution}")
+        self.redistribution = redistribution
         self.G = graph
         self.n = graph.number_of_nodes()
         self.alpha = alpha
@@ -129,6 +136,8 @@ class GraphCA:
             raise ValueError(f"unknown load_mode: {load_mode}")
 
         self.load0 = self.load.copy()
+        self.initial_load = float(self.load.sum())
+        self.dropped_load = 0.0
         self.capacity = (1.0 + alpha) * self.load0
         self.state = np.full(self.n, HEALTHY, dtype=np.int8)
 
@@ -150,7 +159,20 @@ class GraphCA:
     # -- rule components ---------------------------------------------------
 
     def _gather(self):
-        """incoming_i = sum over transient neighbours j of load_j / |N(j)|."""
+        """Compute incoming transfers and unallocated load without mutation."""
+        transient = np.isin(self.state, TRANSIENT)
+        if self.redistribution == "serving_neighbours":
+            serving = np.isin(self.state, SERVING)
+            incoming = np.zeros(self.n)
+            unsent = 0.0
+            for j in np.flatnonzero(transient):
+                neighbours = self.nbr[self.indptr[j]:self.indptr[j + 1]]
+                recipients = neighbours[serving[neighbours]]
+                if recipients.size:
+                    incoming[recipients] += self.load[j] / recipients.size
+                else:
+                    unsent += self.load[j]
+            return incoming, float(unsent)
         spill = np.where(np.isin(self.state, TRANSIENT),
                          self.load / self.degree, 0.0)
         incoming = np.zeros(self.n)
@@ -158,7 +180,11 @@ class GraphCA:
         for j in active:
             lo, hi = self.indptr[j], self.indptr[j + 1]
             incoming[self.nbr[lo:hi]] += spill[j]
-        return incoming
+        # Retain the legacy divisor, including its treatment of isolated
+        # nodes, while recording shares absent from the neighbour lists.
+        unsent = self.load[transient] * (
+            1.0 - np.diff(self.indptr)[transient] / self.degree[transient])
+        return incoming, float(unsent.sum())
 
     def telemetry(self):
         util = self.load / self.capacity
@@ -170,7 +196,12 @@ class GraphCA:
 
     def step(self):
         """One synchronous update of the whole population."""
-        new_load = self.load + self._gather()
+        incoming, unsent = self._gather()
+        transient = np.isin(self.state, TRANSIENT)
+        absorbing = np.isin(self.state, (DOWN, QUARANTINED))
+        self.dropped_load += float(incoming[transient | absorbing].sum()
+                                   + unsent + self.load[absorbing].sum())
+        new_load = self.load + incoming
         new_state = self.state.copy()
 
         new_state[self.state == SHEDDING] = DOWN
@@ -251,8 +282,17 @@ class GraphCA:
             "degraded_cell_steps": self.degraded_cell_steps,
             "true_positive": self.n_true_positive,
             "false_positive": self.n_false_positive,
+            **self.load_accounting(),
             **getattr(self, "_run_info", {}),
         }
+
+    def load_accounting(self):
+        """Current load includes transient cells awaiting their next transfer."""
+        current = float(self.load.sum())
+        return {"redistribution": self.redistribution,
+                "initial_load": self.initial_load, "current_load": current,
+                "dropped_load": self.dropped_load,
+                "load_balance_error": self.initial_load - current - self.dropped_load}
 
 
 # --------------------------------------------------------------------------
@@ -260,10 +300,10 @@ class GraphCA:
 # --------------------------------------------------------------------------
 
 def run_trial(graph, alpha, theta=np.inf, noise=0.0, load_mode="uniform",
-              seed_node=None, seed=None, *, steps=None):
+              seed_node=None, seed=None, *, steps=None, redistribution="legacy"):
     """Seed one failure. Stochastic trials require an explicit window."""
     ca = GraphCA(graph, alpha=alpha, theta=theta, noise=noise,
-                 load_mode=load_mode, seed=seed)
+                 load_mode=load_mode, seed=seed, redistribution=redistribution)
     node = ca.seed_failure(seed_node)
     history = ca.run(steps=steps)
     out = ca.summary()
@@ -276,12 +316,13 @@ def run_trial(graph, alpha, theta=np.inf, noise=0.0, load_mode="uniform",
 
 
 def run_episode(graph, alpha, theta, steps=150, noise=0.03, fault_rate=2e-4,
-                fault_signal=0.35, load_mode="uniform", seed=None):
+                fault_signal=0.35, load_mode="uniform", seed=None, *,
+                redistribution="legacy"):
     """Run under a background fault rate with the detector at `theta`, and
     decompose damage exactly as `lattice.run_episode` does."""
     ca = GraphCA(graph, alpha=alpha, theta=theta, noise=noise,
                  fault_rate=fault_rate, fault_signal=fault_signal,
-                 load_mode=load_mode, seed=seed)
+                 load_mode=load_mode, seed=seed, redistribution=redistribution)
     ca.run_for(steps)
     n = ca.n
     unremediated = ca.degraded_cell_steps / n
@@ -295,13 +336,14 @@ def run_episode(graph, alpha, theta, steps=150, noise=0.03, fault_rate=2e-4,
         "total_damage": unremediated + overload + false_positive,
         "removed_fraction": ca.removed_fraction,
         "ca": ca,
+        **ca.load_accounting(),
         **ca._run_info,
     }
 
 
 def sweep_theta(graph, thetas, alpha=0.6, replicates=8, steps=150, noise=0.03,
                 fault_rate=2e-4, fault_signal=0.35, load_mode="uniform",
-                seed=0):
+                seed=0, *, redistribution="legacy"):
     """Sweep detector sensitivity and return the damage decomposition."""
     keys = ("unremediated", "overload", "false_positive", "total_damage")
     out = {k: [] for k in keys}
@@ -310,7 +352,8 @@ def sweep_theta(graph, thetas, alpha=0.6, replicates=8, steps=150, noise=0.03,
         runs = [run_episode(graph, alpha, th, steps=steps, noise=noise,
                             fault_rate=fault_rate, fault_signal=fault_signal,
                             load_mode=load_mode,
-                            seed=seed * 10000 + i * 100 + r)
+                            seed=seed * 10000 + i * 100 + r,
+                            redistribution=redistribution)
                 for r in range(replicates)]
         for k in keys:
             out[k].append(float(np.mean([r[k] for r in runs])))
@@ -320,7 +363,8 @@ def sweep_theta(graph, thetas, alpha=0.6, replicates=8, steps=150, noise=0.03,
 
 
 def avalanche_sizes(graph, alpha, trials=400, theta=np.inf, noise=0.0,
-                    load_mode="uniform", seed=0, *, steps=None):
+                    load_mode="uniform", seed=0, *, steps=None,
+                    redistribution="legacy"):
     """Avalanche size from `trials` independent single-cell failures, together
     with the degree of each seeded cell."""
     rng = np.random.default_rng(seed)
@@ -329,7 +373,8 @@ def avalanche_sizes(graph, alpha, trials=400, theta=np.inf, noise=0.0,
         node = int(rng.integers(graph.number_of_nodes()))
         r = run_trial(graph, alpha, theta=theta, noise=noise,
                       load_mode=load_mode, seed_node=node,
-                      seed=int(rng.integers(1 << 30)), steps=steps)
+                      seed=int(rng.integers(1 << 30)), steps=steps,
+                      redistribution=redistribution)
         sizes.append(r["avalanche_size"])
         degrees.append(r["seed_degree"])
     return np.asarray(sizes), np.asarray(degrees)
