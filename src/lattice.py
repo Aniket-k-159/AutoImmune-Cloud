@@ -197,7 +197,10 @@ class LatticeCA:
           * noise -- which makes the two populations overlap, so no threshold
             can separate them cleanly
         """
-        util = self.load / self.capacity
+        # Apply the same zero-capacity convention as the graph model.
+        util = np.divide(self.load, self.capacity, out=np.zeros_like(self.load),
+                         where=self.capacity != 0)
+        util[(self.capacity == 0) & (self.load > 0)] = np.inf
         if self.fault_signal:
             util = util + self.fault_signal * (self.state == DEGRADED)
         if self.noise > 0:

@@ -90,7 +90,8 @@ class GraphCA:
     Parameters
     ----------
     graph : nx.Graph
-        The interaction topology. Node labels must be 0..n-1.
+        The interaction topology. At least one node is required; node labels
+        must be 0..n-1. Reported degrees include zero for isolated nodes.
     alpha : float
         Spare capacity. capacity = (1 + alpha) * initial load.
     theta : float
@@ -102,7 +103,9 @@ class GraphCA:
         choice for a controlled comparison against the lattice. "degree" makes
         initial load proportional to degree, which is more realistic for a
         service dependency graph where widely-called services carry more
-        traffic.
+        traffic. Isolated nodes then have zero load and capacity, with zero
+        utilisation before fault signal and noise. An edgeless graph cannot
+        normalise degree-based load; use "uniform" for that topology.
     redistribution : "legacy" | "serving_neighbours"
         As in LatticeCA: preserve static-neighbour sharing, or transfer only
         to neighbours serving at the start of the step. Unserved load is
@@ -117,6 +120,8 @@ class GraphCA:
         self.redistribution = redistribution
         self.G = graph
         self.n = graph.number_of_nodes()
+        if self.n == 0:
+            raise ValueError("graph must contain at least one node")
         self.alpha = alpha
         self.theta = theta
         self.noise = noise
@@ -124,14 +129,16 @@ class GraphCA:
         self.fault_signal = fault_signal
         self.rng = np.random.default_rng(seed)
 
-        self.degree = np.array([max(graph.degree(i), 1) for i in range(self.n)],
+        self.degree = np.array([graph.degree(i) for i in range(self.n)],
                                dtype=float)
+        self._degree_divisor = np.maximum(self.degree, 1.0)
 
         if load_mode == "uniform":
             self.load = np.ones(self.n, dtype=float)
         elif load_mode == "degree":
-            d = np.array([graph.degree(i) for i in range(self.n)], dtype=float)
-            self.load = d / d.mean()
+            if not np.any(self.degree):
+                raise ValueError("degree-based load requires at least one edge")
+            self.load = self.degree / self.degree.mean()
         else:
             raise ValueError(f"unknown load_mode: {load_mode}")
 
@@ -174,7 +181,7 @@ class GraphCA:
                     unsent += self.load[j]
             return incoming, float(unsent)
         spill = np.where(np.isin(self.state, TRANSIENT),
-                         self.load / self.degree, 0.0)
+                         self.load / self._degree_divisor, 0.0)
         incoming = np.zeros(self.n)
         active = np.nonzero(spill)[0]
         for j in active:
@@ -183,11 +190,15 @@ class GraphCA:
         # Retain the legacy divisor, including its treatment of isolated
         # nodes, while recording shares absent from the neighbour lists.
         unsent = self.load[transient] * (
-            1.0 - np.diff(self.indptr)[transient] / self.degree[transient])
+            1.0 - np.diff(self.indptr)[transient] / self._degree_divisor[transient])
         return incoming, float(unsent.sum())
 
     def telemetry(self):
-        util = self.load / self.capacity
+        # No work and no capacity means zero utilisation, not missing data.
+        # Positive work without capacity is overload, represented by infinity.
+        util = np.divide(self.load, self.capacity, out=np.zeros_like(self.load),
+                         where=self.capacity != 0)
+        util[(self.capacity == 0) & (self.load > 0)] = np.inf
         if self.fault_signal:
             util = util + self.fault_signal * (self.state == DEGRADED)
         if self.noise > 0:
