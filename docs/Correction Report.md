@@ -43,3 +43,17 @@ Environment: Python 3.12.14, NumPy 2.5.3, NetworkX 3.6.1 and Matplotlib 3.11.2.
 **Results:** The original cells reproduce the published legacy numerical output. In the 7×7 counterexample at step 2, legacy load is 47.75 with 1.25 recorded as dropped; the optional rule retains 49 with none dropped. Both account for the initial 49 units. In Notebook 02's 300-trial scale-free sample, near-total cascades rise from 0% to 48.7% under the optional rule. Notebook 03's baseline scan moves from theta=1.00, damage=0.145 to theta=1.02, damage=0.577.
 
 **Outcome:** Load loss is now explicit. The optional rule can concentrate load and worsen cascades; it does not guarantee zero loss or improved safety. These comparisons retain the existing cost measure and finite observation horizon. Earlier conclusions remain conditional on the redistribution rule and sampled conditions.
+
+## Issue #3 — Isolated nodes and zero-capacity telemetry
+
+[Issue #3](https://github.com/Aniket-k-159/AutoImmune-Cloud/issues/3) · [Fix: 9079fe7](https://github.com/Aniket-k-159/AutoImmune-Cloud/commit/9079fe7187e2d07b932233c4bb41c24d05ca8559)
+
+**Problem:** Degree-based load gave isolated nodes zero load and capacity, producing NaN telemetry that prevented fault detection. Their reported degree was also changed from 0 to 1.
+
+**Plan:** Separate actual degrees from division safeguards, define zero-load/zero-capacity utilisation as zero while retaining fault signals, and reject degree-based load on edgeless graphs. Both models use the same zero-capacity telemetry rule.
+
+**Validation (26 September 2026):** All three notebooks were run in fresh Jupyter/IPython kernels using commit `9079fe7`, completing 11, 14 and 9 code cells and saving 10 figures. Notebook 02 adds the direct boundary checks; every earlier code and explanatory cell is preserved, and its numerical output is unchanged.
+
+**Results:** The three-node example now reports `[1, 1, 0]`. Under both redistribution rules, the isolated node's healthy signal is 0; a fault signal of 1 exceeds threshold 0.9 and produces one correct isolation. Load accounting remains balanced. Uniform load on an isolated node reports `seed_degree=0` and records its dropped load. Edgeless degree-based load raises a clear error instead of creating NaN values.
+
+**Outcome:** Isolated-node measurement and detection are corrected without changing the existing experiment results. Positive load with zero capacity is still treated as overload; the fix does not silently make such a node healthy.
