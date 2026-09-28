@@ -72,6 +72,7 @@ excess to lattice neighbours. It differs in two ways that matter:
 
 import numpy as np
 import run_protocol
+from random_protocol import RandomProtocol
 
 # --- states ---------------------------------------------------------------
 HEALTHY = 0
@@ -112,6 +113,13 @@ class LatticeCA:
     load_sigma : float
         Lognormal spread of initial per-cell load. 0 gives a uniform lattice.
     seed : int | None
+    randomness : "legacy" | "split"
+        "legacy" preserves the shared self.rng draw order. "split" separates
+        initialization, perturbation, faults and telemetry; potential faults
+        and noise are indexed by absolute timestep and flat row-major cell ID.
+    stream_seeds : mapping | None
+        Optional nonnegative integer seeds for named split streams. Record
+        random_info() to replay a run, including one started with seed=None.
     redistribution : "legacy" | "serving_neighbours"
         "legacy" shares across all static neighbours and records cleared
         shares as dropped load. "serving_neighbours" shares only across
@@ -122,7 +130,8 @@ class LatticeCA:
     def __init__(self, width=60, height=60, alpha=0.3,
                  neighbourhood="von_neumann", theta=np.inf, noise=0.0,
                  load_sigma=0.0, fault_rate=0.0, fault_signal=0.35,
-                 seed=None, *, redistribution="legacy"):
+                 seed=None, *, redistribution="legacy",
+                 randomness="legacy", stream_seeds=None):
         if redistribution not in ("legacy", "serving_neighbours"):
             raise ValueError(f"unknown redistribution: {redistribution}")
         self.redistribution = redistribution
@@ -132,7 +141,9 @@ class LatticeCA:
         self.noise = noise
         self.fault_rate = fault_rate
         self.fault_signal = fault_signal
-        self.rng = np.random.default_rng(seed)
+        self._random = RandomProtocol(seed, randomness, stream_seeds)
+        self.randomness = randomness
+        self.rng = np.random.default_rng(self._random.seed)
 
         # cumulative damage, attributed to its source
         self.degraded_cell_steps = 0    # faults left unremediated
@@ -147,7 +158,8 @@ class LatticeCA:
 
         self.state = np.full((height, width), HEALTHY, dtype=np.int8)
         if load_sigma > 0:
-            self.load = self.rng.lognormal(0.0, load_sigma, (height, width))
+            rng = self.rng if randomness == "legacy" else self._random.initialization
+            self.load = rng.lognormal(0.0, load_sigma, (height, width))
         else:
             self.load = np.ones((height, width), dtype=float)
         self.load0 = self.load.copy()
@@ -204,7 +216,11 @@ class LatticeCA:
         if self.fault_signal:
             util = util + self.fault_signal * (self.state == DEGRADED)
         if self.noise > 0:
-            util = util + self.rng.normal(0.0, self.noise, util.shape)
+            if self.randomness == "split":
+                util = util + self.noise * self._random.field(
+                    "telemetry", self.t, self.state.shape)
+            else:
+                util = util + self.rng.normal(0.0, self.noise, util.shape)
         return util
 
     def step(self):
@@ -248,8 +264,10 @@ class LatticeCA:
         # 3. new faults appear independently among serving cells
         if self.fault_rate > 0:
             healthy_now = self.state == HEALTHY
-            struck = healthy_now & (self.rng.random(self.state.shape)
-                                    < self.fault_rate)
+            potential = (self._random.field("faults", self.t, self.state.shape)
+                         if self.randomness == "split"
+                         else self.rng.random(self.state.shape))
+            struck = healthy_now & (potential < self.fault_rate)
             new_state[struck] = DEGRADED
 
         # 4. every serving cell applies the local rule. Overload is checked
@@ -325,9 +343,22 @@ class LatticeCA:
     def removed_fraction(self):
         return self.n_removed / self.n_cells
 
+    def random_inputs(self, step=None):
+        """Potential inputs for an absolute step (default: current t), split only.
+
+        Returns fresh full-population arrays without advancing any generator.
+        Repeated telemetry at a fixed t uses this same standardized noise.
+        """
+        return self._random.inputs(self.t if step is None else step, self.state.shape)
+
+    def random_info(self):
+        """Serializable protocol version, actual root seed and stream seeds."""
+        return self._random.info()
+
     def summary(self):
         return {
             "steps": self.t,
+            "random_info": self.random_info(),
             "removed": self.n_removed,
             "overload": self.n_down,
             "quarantined": self.n_quarantined,
@@ -352,7 +383,7 @@ class LatticeCA:
 def run_episode(alpha, theta, steps=150, width=50, height=50,
                 neighbourhood="von_neumann", noise=0.03, load_sigma=0.0,
                 fault_rate=2e-4, fault_signal=0.35, seed=None, *,
-                redistribution="legacy"):
+                redistribution="legacy", randomness="legacy", stream_seeds=None):
     """
     Run a platform for a fixed number of steps under a background fault rate,
     with the detector operating at threshold `theta`.
@@ -374,7 +405,9 @@ def run_episode(alpha, theta, steps=150, width=50, height=50,
     ca = LatticeCA(width=width, height=height, alpha=alpha,
                    neighbourhood=neighbourhood, theta=theta, noise=noise,
                    load_sigma=load_sigma, fault_rate=fault_rate,
-                   fault_signal=fault_signal, seed=seed, redistribution=redistribution)
+                   fault_signal=fault_signal, seed=seed,
+                   redistribution=redistribution, randomness=randomness,
+                   stream_seeds=stream_seeds)
     ca.run_for(steps)
 
     n = ca.n_cells
@@ -391,6 +424,7 @@ def run_episode(alpha, theta, steps=150, width=50, height=50,
         "total_damage": unremediated + overload + false_positive,
         "removed_fraction": ca.removed_fraction,
         "ca": ca,
+        "random_info": ca.random_info(),
         **ca.load_accounting(),
         **ca._run_info,
     }
@@ -399,24 +433,30 @@ def run_episode(alpha, theta, steps=150, width=50, height=50,
 def sweep_theta(thetas, alpha=0.6, replicates=8, steps=150, width=50,
                 height=50, neighbourhood="von_neumann", noise=0.03,
                 fault_rate=2e-4, fault_signal=0.35, seed=0, *,
-                redistribution="legacy"):
+                redistribution="legacy", randomness="legacy"):
     """
     Sweep detector sensitivity and return the damage decomposition.
 
     Returns a dict of arrays, each aligned with `thetas`: the three damage
     components, the total, and the variance of the total across replicates
     (the susceptibility, which peaks at a transition).
+
+    Split mode pairs replicate r across thresholds using seed*10000 + r.
+    Legacy retains independent threshold schedules seed*10000 + i*100 + r.
+    Stream overrides are intentionally unavailable for aggregate helpers:
+    fixed overrides would repeat identical streams across replicates.
     """
     keys = ("unremediated", "overload", "false_positive", "total_damage")
     out = {k: [] for k in keys}
     out["susceptibility"] = []
 
     for i, th in enumerate(thetas):
+        base_seed = seed * 10000 + (i * 100 if randomness == "legacy" else 0)
         runs = [run_episode(alpha, th, steps=steps, width=width, height=height,
                             neighbourhood=neighbourhood, noise=noise,
                             fault_rate=fault_rate, fault_signal=fault_signal,
-                            seed=seed * 10000 + i * 100 + r,
-                            redistribution=redistribution)
+                            seed=base_seed + r,
+                            redistribution=redistribution, randomness=randomness)
                 for r in range(replicates)]
         for k in keys:
             out[k].append(float(np.mean([r[k] for r in runs])))
@@ -428,11 +468,13 @@ def sweep_theta(thetas, alpha=0.6, replicates=8, steps=150, width=50,
 
 def run_trial(alpha, width=60, height=60, neighbourhood="von_neumann",
               theta=np.inf, noise=0.0, load_sigma=0.0, seed=None, *, steps=None,
-              redistribution="legacy"):
+              redistribution="legacy", randomness="legacy", stream_seeds=None):
     """Seed the centre cell. Stochastic trials require an explicit window."""
     ca = LatticeCA(width=width, height=height, alpha=alpha,
                    neighbourhood=neighbourhood, theta=theta, noise=noise,
-                   load_sigma=load_sigma, seed=seed, redistribution=redistribution)
+                   load_sigma=load_sigma, seed=seed,
+                   redistribution=redistribution, randomness=randomness,
+                   stream_seeds=stream_seeds)
     ca.seed_failure()
     history = ca.run(steps=steps)
     out = ca.summary()
@@ -444,14 +486,21 @@ def run_trial(alpha, width=60, height=60, neighbourhood="von_neumann",
 
 def sweep_alpha(alphas, replicates=10, width=60, height=60,
                 neighbourhood="von_neumann", theta=np.inf, noise=0.0,
-                load_sigma=0.3, seed=0, *, steps=None, redistribution="legacy"):
+                load_sigma=0.3, seed=0, *, steps=None, redistribution="legacy",
+                randomness="legacy"):
     """Sweep spare capacity. Returns mean removed fraction, its standard
-    deviation, and susceptibility (variance across replicates)."""
+    deviation, and susceptibility (variance across replicates).
+
+    Both modes reuse seed*1000 + r across alpha values. Split mode keeps each
+    replicate's potential inputs aligned even when its trajectories differ.
+    Fixed stream overrides are excluded to preserve distinct replicates.
+    """
     mean, std, susceptibility = [], [], []
     for a in alphas:
         vals = [run_trial(a, width, height, neighbourhood, theta, noise,
                           load_sigma, seed=seed * 1000 + r, steps=steps,
-                          redistribution=redistribution)["removed_fraction"]
+                          redistribution=redistribution,
+                          randomness=randomness)["removed_fraction"]
                 for r in range(replicates)]
         vals = np.asarray(vals)
         mean.append(vals.mean())

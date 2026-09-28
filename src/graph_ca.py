@@ -32,6 +32,7 @@ all-or-nothing transition into avalanches of every size.
 
 import numpy as np
 import run_protocol
+from random_protocol import RandomProtocol
 import networkx as nx
 
 from lattice import (HEALTHY, SHEDDING, DOWN, QUARANTINING, QUARANTINED,
@@ -98,6 +99,13 @@ class GraphCA:
         Detector threshold. np.inf disables the detector.
     noise, fault_rate, fault_signal : float
         As in LatticeCA.
+    randomness : "legacy" | "split"
+        As in LatticeCA. Split potential inputs use graph node IDs 0..n-1,
+        matching flat row-major lattice IDs. self.rng retains its role in
+        legacy mode; split mode uses the four separate named streams.
+    stream_seeds : mapping | None
+        Optional nonnegative integer overrides for split stream seeds.
+        random_info() records all effective seeds, including seed=None entropy.
     load_mode : "uniform" | "degree"
         "uniform" gives every cell the same initial load, which is the right
         choice for a controlled comparison against the lattice. "degree" makes
@@ -114,7 +122,8 @@ class GraphCA:
 
     def __init__(self, graph, alpha=0.3, theta=np.inf, noise=0.0,
                  fault_rate=0.0, fault_signal=0.35, load_mode="uniform",
-                 seed=None, *, redistribution="legacy"):
+                 seed=None, *, redistribution="legacy",
+                 randomness="legacy", stream_seeds=None):
         if redistribution not in ("legacy", "serving_neighbours"):
             raise ValueError(f"unknown redistribution: {redistribution}")
         self.redistribution = redistribution
@@ -127,7 +136,9 @@ class GraphCA:
         self.noise = noise
         self.fault_rate = fault_rate
         self.fault_signal = fault_signal
-        self.rng = np.random.default_rng(seed)
+        self._random = RandomProtocol(seed, randomness, stream_seeds)
+        self.randomness = randomness
+        self.rng = np.random.default_rng(self._random.seed)
 
         self.degree = np.array([graph.degree(i) for i in range(self.n)],
                                dtype=float)
@@ -202,7 +213,11 @@ class GraphCA:
         if self.fault_signal:
             util = util + self.fault_signal * (self.state == DEGRADED)
         if self.noise > 0:
-            util = util + self.rng.normal(0.0, self.noise, self.n)
+            if self.randomness == "split":
+                util = util + self.noise * self._random.field(
+                    "telemetry", self.t, self.state.shape)
+            else:
+                util = util + self.rng.normal(0.0, self.noise, self.n)
         return util
 
     def step(self):
@@ -221,8 +236,9 @@ class GraphCA:
         new_load[np.isin(self.state, (DOWN, QUARANTINED))] = 0.0
 
         if self.fault_rate > 0:
-            struck = ((self.state == HEALTHY)
-                      & (self.rng.random(self.n) < self.fault_rate))
+            potential = (self._random.field("faults", self.t, self.state.shape)
+                         if self.randomness == "split" else self.rng.random(self.n))
+            struck = (self.state == HEALTHY) & (potential < self.fault_rate)
             new_state[struck] = DEGRADED
 
         serving = np.isin(self.state, SERVING)
@@ -259,9 +275,15 @@ class GraphCA:
     # -- seeding and measurement ------------------------------------------
 
     def seed_failure(self, node=None, rng=None):
-        """Remove one cell to start a cascade."""
+        """Remove one cell, using the split perturbation stream when needed.
+
+        An explicit external rng takes precedence in either mode. The lattice
+        counterpart defaults to its centre and consumes no perturbation draw.
+        """
         if node is None:
-            rng = self.rng if rng is None else rng
+            if rng is None:
+                rng = (self.rng if self.randomness == "legacy"
+                       else self._random.perturbation)
             node = int(rng.integers(self.n))
         self.state[node] = SHEDDING
         return node
@@ -283,9 +305,22 @@ class GraphCA:
     def removed_fraction(self):
         return self.n_removed / self.n
 
+    def random_inputs(self, step=None):
+        """Potential inputs for an absolute step (default: current t), split only.
+
+        Returns fresh full-population arrays without advancing any generator.
+        Repeated telemetry at a fixed t uses this same standardized noise.
+        """
+        return self._random.inputs(self.t if step is None else step, self.state.shape)
+
+    def random_info(self):
+        """Serializable protocol version, actual root seed and stream seeds."""
+        return self._random.info()
+
     def summary(self):
         return {
             "steps": self.t,
+            "random_info": self.random_info(),
             "removed": self.n_removed,
             "overload": self.n_down,
             "quarantined": self.n_quarantined,
@@ -311,10 +346,12 @@ class GraphCA:
 # --------------------------------------------------------------------------
 
 def run_trial(graph, alpha, theta=np.inf, noise=0.0, load_mode="uniform",
-              seed_node=None, seed=None, *, steps=None, redistribution="legacy"):
+              seed_node=None, seed=None, *, steps=None, redistribution="legacy",
+              randomness="legacy", stream_seeds=None):
     """Seed one failure. Stochastic trials require an explicit window."""
     ca = GraphCA(graph, alpha=alpha, theta=theta, noise=noise,
-                 load_mode=load_mode, seed=seed, redistribution=redistribution)
+                 load_mode=load_mode, seed=seed, redistribution=redistribution,
+                 randomness=randomness, stream_seeds=stream_seeds)
     node = ca.seed_failure(seed_node)
     history = ca.run(steps=steps)
     out = ca.summary()
@@ -328,12 +365,13 @@ def run_trial(graph, alpha, theta=np.inf, noise=0.0, load_mode="uniform",
 
 def run_episode(graph, alpha, theta, steps=150, noise=0.03, fault_rate=2e-4,
                 fault_signal=0.35, load_mode="uniform", seed=None, *,
-                redistribution="legacy"):
+                redistribution="legacy", randomness="legacy", stream_seeds=None):
     """Run under a background fault rate with the detector at `theta`, and
     decompose damage exactly as `lattice.run_episode` does."""
     ca = GraphCA(graph, alpha=alpha, theta=theta, noise=noise,
                  fault_rate=fault_rate, fault_signal=fault_signal,
-                 load_mode=load_mode, seed=seed, redistribution=redistribution)
+                 load_mode=load_mode, seed=seed, redistribution=redistribution,
+                 randomness=randomness, stream_seeds=stream_seeds)
     ca.run_for(steps)
     n = ca.n
     unremediated = ca.degraded_cell_steps / n
@@ -347,6 +385,7 @@ def run_episode(graph, alpha, theta, steps=150, noise=0.03, fault_rate=2e-4,
         "total_damage": unremediated + overload + false_positive,
         "removed_fraction": ca.removed_fraction,
         "ca": ca,
+        "random_info": ca.random_info(),
         **ca.load_accounting(),
         **ca._run_info,
     }
@@ -354,17 +393,24 @@ def run_episode(graph, alpha, theta, steps=150, noise=0.03, fault_rate=2e-4,
 
 def sweep_theta(graph, thetas, alpha=0.6, replicates=8, steps=150, noise=0.03,
                 fault_rate=2e-4, fault_signal=0.35, load_mode="uniform",
-                seed=0, *, redistribution="legacy"):
-    """Sweep detector sensitivity and return the damage decomposition."""
+                seed=0, *, redistribution="legacy",
+                randomness="legacy"):
+    """Sweep detector sensitivity and return the damage decomposition.
+
+    Split mode pairs replicate r across thresholds using seed*10000 + r.
+    Legacy retains independent threshold schedules seed*10000 + i*100 + r.
+    Stream overrides are excluded so replicates cannot share fixed streams.
+    """
     keys = ("unremediated", "overload", "false_positive", "total_damage")
     out = {k: [] for k in keys}
     out["susceptibility"] = []
     for i, th in enumerate(thetas):
+        base_seed = seed * 10000 + (i * 100 if randomness == "legacy" else 0)
         runs = [run_episode(graph, alpha, th, steps=steps, noise=noise,
                             fault_rate=fault_rate, fault_signal=fault_signal,
                             load_mode=load_mode,
-                            seed=seed * 10000 + i * 100 + r,
-                            redistribution=redistribution)
+                            seed=base_seed + r,
+                            redistribution=redistribution, randomness=randomness)
                 for r in range(replicates)]
         for k in keys:
             out[k].append(float(np.mean([r[k] for r in runs])))
@@ -375,17 +421,25 @@ def sweep_theta(graph, thetas, alpha=0.6, replicates=8, steps=150, noise=0.03,
 
 def avalanche_sizes(graph, alpha, trials=400, theta=np.inf, noise=0.0,
                     load_mode="uniform", seed=0, *, steps=None,
-                    redistribution="legacy"):
+                    redistribution="legacy", randomness="legacy"):
     """Avalanche size from `trials` independent single-cell failures, together
-    with the degree of each seeded cell."""
-    rng = np.random.default_rng(seed)
+    with the degree of each seeded cell.
+
+    Split mode selects nodes and model seeds from separate perturbation and
+    initialization streams. Legacy preserves the original interleaved draws.
+    Stream overrides are excluded to keep trial streams distinct.
+    """
+    protocol = RandomProtocol(seed, randomness)
+    rng = np.random.default_rng(protocol.seed)
+    node_rng = rng if randomness == "legacy" else protocol.perturbation
+    model_rng = rng if randomness == "legacy" else protocol.initialization
     sizes, degrees = [], []
     for _ in range(trials):
-        node = int(rng.integers(graph.number_of_nodes()))
+        node = int(node_rng.integers(graph.number_of_nodes()))
         r = run_trial(graph, alpha, theta=theta, noise=noise,
                       load_mode=load_mode, seed_node=node,
-                      seed=int(rng.integers(1 << 30)), steps=steps,
-                      redistribution=redistribution)
+                      seed=int(model_rng.integers(1 << 30)), steps=steps,
+                      redistribution=redistribution, randomness=randomness)
         sizes.append(r["avalanche_size"])
         degrees.append(r["seed_degree"])
     return np.asarray(sizes), np.asarray(degrees)
