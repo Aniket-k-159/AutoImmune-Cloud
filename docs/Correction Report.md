@@ -71,3 +71,17 @@ Environment: Python 3.12.14, NumPy 2.5.3, NetworkX 3.6.1 and Matplotlib 3.11.2.
 **Results:** In the 6×6, seed-7 example, legacy fault states differ from timestep 2 when comparing a disabled detector with a very high threshold. Split inputs and states agree through all three steps, including after extra telemetry calls. Graph and lattice checks agree under both redistribution rules. Notebook 03 completes 152 trials with 24 training seeds and 40 separate evaluation seeds; its paired damage difference is -2.8125, with a 95% bootstrap interval of [-3.164844, -2.462881] for the stated fixed-grid experiment.
 
 **Outcome:** Split mode supports controlled, repeatable comparisons. Shared potential inputs do not require identical actual faults once strategies remove different nodes. The damage comparison uses the existing cost measure and finite horizon; it does not establish improved availability or a universally optimal threshold.
+
+## Issue #5 — Reproducible demonstration node selection
+
+[Issue #5](https://github.com/Aniket-k-159/AutoImmune-Cloud/issues/5) · [Fix: 9e6ef64](https://github.com/Aniket-k-159/AutoImmune-Cloud/commit/9e6ef6415865d50ccda16088b194c507f7534b1e)
+
+**Problem:** Equal-degree nodes had no explicit ordering, so demonstration selections and their cascade sizes could differ between runs in different environments.
+
+**Plan:** Select actual node IDs by degree, break ties by ascending node ID, and record exact dependencies in `requirements-repro.txt`.
+
+**Validation (1 October 2026):** All three notebooks were fully rerun in fresh Jupyter/IPython kernels using commit `9e6ef64`, completing 12, 15 and 10 code cells and saving 10 figures. Their cell sources match the published version. All other printed results match the previous results batch.
+
+**Results:** Notebook 02 now selects low-degree nodes `[57, 96, 99, 102, 119]`, each with degree 2 and avalanche size 2. Its high-degree selections `[3, 0, 25, 5, 8]` each produce avalanche size 0. The selected IDs and results are saved in the notebook output.
+
+**Outcome:** Demonstrations now use an explicit, repeatable selection rule. The changed examples reflect different selected nodes, not changed model dynamics; five selected nodes do not establish a general degree effect. The dependency snapshot records the validated Windows/Python environment; installation in a fresh environment has not been tested.
